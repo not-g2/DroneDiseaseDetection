@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""
-explore_dronekit_online.py
-
-Frontier + A* exploration integrated with DroneKit (SITL) and a turtle
-visualization whose orientation matches Mission Planner:
-    - North is up (positive Y)
-    - East is right (positive X)
-Exploration is online: the next move is computed dynamically.
-
-Requirements:
- - dronekit, pymavlink
- - numpy
- - astar.py (your A* implementation) available in same folder
-"""
-
 import time
 import math
 import threading
@@ -25,11 +9,15 @@ from dronekit import connect, VehicleMode, LocationGlobalRelative
 from astar import astar 
 
 CELL_SIZE_PIXELS = 28
-METERS_PER_CELL = 25.0
+METERS_PER_CELL = 5.0
 DRONEKIT_CONN = "udp:127.0.0.1:14550"  # change to your SITL output
-TAKEOFF_ALT = 10.0
+TAKEOFF_ALT = 5.0
 GOTO_TIMEOUT = 30
-REACH_THRESH_M = 2.0 
+REACH_THRESH_M = 2.0
+UNKNOWN_CELL = -1
+FREE_CELL = 0
+DISEASE_CELL = 1
+OBSTACLE_CELL = 2
 
 class Visualizer:
     def __init__(self, grid_size, obstacles, diseases, drone_start):
@@ -118,7 +106,7 @@ class Visualizer:
 def start_turtle_loop():
     turtle.mainloop()
 
-class pathFinder():
+class pathFinder:
     def __init__(self, grid, droneStart, numOfDiseases, numOfObstacles, wDist, wUnexplored, visualize):
         self.grid_size = grid
         self.drone_start = droneStart
@@ -135,17 +123,18 @@ class pathFinder():
             x, y = random.randint(0, self.grid_size-1), random.randint(0, self.grid_size-1)
             while (x, y) in self.diseases_loc or (x, y) in self.obstacles_loc or (x, y) == self.drone_start:
                 x, y = random.randint(0, self.grid_size-1), random.randint(0, self.grid_size-1)
-            self.grid[x][y] = 1
+            self.grid[x][y] = DISEASE_CELL
             self.diseases_loc.add((x, y))
 
         for _ in range(self.num_of_obstacles):
             x, y = random.randint(0, self.grid_size-1), random.randint(0, self.grid_size-1)
             while (x, y) in self.obstacles_loc or (x, y) in self.diseases_loc or (x, y) == self.drone_start:
                 x, y = random.randint(0, self.grid_size-1), random.randint(0, self.grid_size-1)
-            self.grid[x][y] = 2
+            self.grid[x][y] = OBSTACLE_CELL
             self.obstacles_loc.add((x, y))
 
-        self.drone_map = np.full_like(self.grid, fill_value=-1)
+        self.drone_map = np.full_like(self.grid, fill_value=UNKNOWN_CELL)
+        self.drone_map[droneStart] = 0
 
     def grid_to_gps(self, cell, home_gps, meters_per_cell=METERS_PER_CELL):
         lat0, lon0, alt0 = home_gps
@@ -164,35 +153,77 @@ class pathFinder():
         nei = []
         for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1)]:
             nx, ny = x+dx, y+dy
-            if 0<=nx<self.grid_size and 0<=ny<self.grid_size and self.drone_map[nx][ny]==-1:
-                if self.grid[nx][ny]==2:
-                    self.drone_map[nx][ny]=2
+            if 0<=nx<self.grid_size and 0<=ny<self.grid_size and self.drone_map[nx][ny]==UNKNOWN_CELL:
+                if self.grid[nx][ny]==OBSTACLE_CELL:
+                    self.drone_map[nx][ny]=OBSTACLE_CELL
                 else:
-                    self.drone_map[nx][ny]=0
+                    self.drone_map[nx][ny]=FREE_CELL
                     nei.append((nx,ny))
         return nei
 
     def check_disease(self, point):
-        if self.grid[point[0]][point[1]]==1:
-            self.drone_map[point[0]][point[1]]=1
+        if self.grid[point[0]][point[1]]==DISEASE_CELL:
+            self.drone_map[point[0]][point[1]]=DISEASE_CELL
             return True
         return False
 
     def next_step(self, cur_pos, frontiers):
-        def score(f, cur_pos, drone_map):
-            dist = abs(f[0]-cur_pos[0]) + abs(f[1]-cur_pos[1])
-            unexplored = sum(
-                1 for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]
-                if 0<=f[0]+dx<len(drone_map) and 0<=f[1]+dy<len(drone_map)
-                and drone_map[f[0]+dx][f[1]+dy]==-1
-            )
-            return dist*self.w_dist + unexplored*self.w_unexplored
-
         if not frontiers:
-            return None, None
-        best_frontier = min(frontiers, key=lambda f: score(f, cur_pos, self.drone_map))
+            return None, None, []
+
+        scored = []
+        for f in frontiers:
+            dist = abs(f[0] - cur_pos[0]) + abs(f[1] - cur_pos[1])
+            unexplored = sum(
+                1
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                if 0 <= f[0] + dx < len(self.drone_map)
+                and 0 <= f[1] + dy < len(self.drone_map)
+                and self.drone_map[f[0] + dx][f[1] + dy] == UNKNOWN_CELL
+            )
+            scored.append((dist, unexplored, f))
+
+        front = pathFinder.pareto_front(scored)
+        chosen = pathFinder.knee_by_utopia(front)
+        best_frontier = chosen[2]
+
         path = astar(cur_pos, best_frontier, self.drone_map, self.grid_size)
         return best_frontier, path
+
+    @staticmethod
+    def knee_by_utopia(pareto):
+        # pareto is [(dist, unexplored, frontier_cell)]
+        min_dist = min(p[0] for p in pareto)
+        max_unexploded = max(p[1] for p in pareto)
+
+        # utopia = (min dist, max unexplored)
+        utopia = (min_dist, -max_unexploded)  # convert unexplored to negative
+
+        best = None
+        best_d = float('inf')
+        for dist, unexploded, f in pareto:
+            d = math.hypot(dist - utopia[0], (-unexploded) - utopia[1])
+            if d < best_d:
+                best_d = d
+                best = (dist, unexploded, f)
+        return best
+
+    @staticmethod
+    def pareto_front(points):
+        pts = [(d, -u, f) for d, u, f in points]
+        front = []
+        for i, (d1, u1, f1) in enumerate(pts):
+            dominated = False
+            for j, (d2, u2, _) in enumerate(pts):
+                if j == i:
+                    continue
+                # j dominates i if <= on both and < on at least one
+                if d2 <= d1 and u2 <= u1 and (d2 < d1 or u2 < u1):
+                    dominated = True
+                    break
+            if not dominated:
+                front.append(points[i])
+        return front
 
 
 def wait_for_gps(vehicle, timeout=30):
@@ -264,9 +295,6 @@ def goto_and_wait(vehicle, lat, lon, alt, timeout=GOTO_TIMEOUT, reach_thresh=REA
             return False
         time.sleep(0.7)
 
-# -------------------------
-# Main
-# -------------------------
 def main(args):
     print("Connecting to vehicle on:", DRONEKIT_CONN)
     vehicle=connect(DRONEKIT_CONN, wait_ready=True, timeout=120)
@@ -274,7 +302,7 @@ def main(args):
     grid_size=args.grid
     droneStart=tuple(map(int,args.droneStart.split(',')))
     pf=pathFinder(grid_size, droneStart, args.numOfDisease, args.numOfObstacles,
-                  args.weightDistance, args.weightUnexplored, visualize=True)
+                  args.weightDistance, args.weightUnexplored, visualize= not args.no_visualize)
 
     viz=Visualizer(grid_size, pf.obstacles_loc, pf.diseases_loc, droneStart)
     t=threading.Thread(target=start_turtle_loop, daemon=True)
@@ -290,8 +318,11 @@ def main(args):
     home_gps=(vehicle.location.global_frame.lat, vehicle.location.global_frame.lon, TAKEOFF_ALT)
     print("Home GPS:", home_gps)
 
+    start_time = time.time()
+    steps_taken = 0
+
     cur_pos=droneStart
-    visited=set([cur_pos])
+    visited= {cur_pos}
     frontiers=set(pf.neighbour(cur_pos))
 
     while frontiers:
@@ -302,6 +333,7 @@ def main(args):
         for node in path[1:]:
             lat, lon, alt=pf.grid_to_gps(node, home_gps, METERS_PER_CELL)
             print(f"Flying to {node} -> {lat:.6f},{lon:.6f}")
+            steps_taken += 1
             viz.move_drone(node[0], node[1])
             goto_and_wait(vehicle, lat, lon, alt, timeout=GOTO_TIMEOUT)
             pf.check_disease(node)
@@ -314,21 +346,24 @@ def main(args):
             if target in frontiers:
                 frontiers.remove(target)
 
+    end_time = time.time()
+    print(f"Time Taken {(end_time - start_time):.2f} s")
+    print(f"Steps Taken {steps_taken}")
     print("Exploration finished, landing...")
     vehicle.mode=VehicleMode("LAND")
     time.sleep(6)
     vehicle.close()
     print("Mission complete. Close the turtle window manually or stop the script.")
 
-
 if __name__=="__main__":
-    parser=argparse.ArgumentParser(description="Frontier+A* online exploration with DroneKit + turtle viz")
-    parser.add_argument("--grid", type=int, default=7)
+    parser=argparse.ArgumentParser(description="")
+    parser.add_argument("--grid", type=int, default=10)
     parser.add_argument("--droneStart", type=str, default="0,0")
     parser.add_argument("--numOfDisease", type=int, default=3)
     parser.add_argument("--numOfObstacles", type=int, default=5)
     parser.add_argument("--weightDistance", type=float, default=2.389346)
     parser.add_argument("--weightUnexplored", type=float, default=2.358536)
+    parser.add_argument("--no-visualize", action="store_true", default=False, help="Disable visualization")
     args=parser.parse_args()
     main(args)
 
