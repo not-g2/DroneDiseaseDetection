@@ -8,16 +8,46 @@ import numpy as np
 from dronekit import connect, VehicleMode, LocationGlobalRelative
 from astar import astar 
 
-CELL_SIZE_PIXELS = 28
-METERS_PER_CELL = 5.0
+CELL_SIZE_PIXELS = 15
+METERS_PER_CELL = 1.0
 DRONEKIT_CONN = "udp:127.0.0.1:14550"  # change to your SITL output
-TAKEOFF_ALT = 5.0
+TAKEOFF_ALT = 1.0
 GOTO_TIMEOUT = 30
 REACH_THRESH_M = 2.0
 UNKNOWN_CELL = -1
 FREE_CELL = 0
 DISEASE_CELL = 1
 OBSTACLE_CELL = 2
+DISEASE_CELL_CORD = [
+    # Bottom-left patch (near south-west)
+    (5, 8), (6, 8), (6, 9), (7, 9),
+
+    # Center-left patch
+    (18, 15), (18, 16), (19, 16), (19, 17),
+
+    # Top-right patch (north-east)
+    (38, 40), (39, 40), (39, 41), (40, 41),
+
+    # Slight scattered infection line (like crop row disease)
+    (30, 25), (31, 26), (32, 27)
+]
+
+OBSTACLE_CELL_CORD = [
+    # Fence along top edge
+    *[(x, 48) for x in range(5, 45, 3)],
+
+    # Fence along right edge
+    *[(48, y) for y in range(5, 45, 3)],
+
+    # Small shed or obstacle cluster mid-field
+    (22, 22), (23, 22), (22, 23), (23, 23),
+
+    # Trees or poles scattered
+    (10, 35), (12, 36), (14, 34),
+    (25, 10), (26, 11),
+    (40, 15), (41, 15), (42, 16)
+]
+
 
 class Visualizer:
     def __init__(self, grid_size, obstacles, diseases, drone_start):
@@ -46,10 +76,11 @@ class Visualizer:
 
         self.drone_t = turtle.Turtle()
         self.drone_t.shape("square")
-        self.drone_t.shapesize(stretch_wid=0.9, stretch_len=0.9)
+        scale = CELL_SIZE_PIXELS / 20  # default turtle square size is 20px
+        self.drone_t.shapesize(stretch_wid=scale, stretch_len=scale)
         self.drone_t.color("red")
         self.drone_t.penup()
-        self.drone_t.speed(0)
+        self.drone_t.speed(1)
         self.move_drone(drone_start[0], drone_start[1])
 
     def _draw_grid_background(self):
@@ -106,35 +137,29 @@ class Visualizer:
 def start_turtle_loop():
     turtle.mainloop()
 
-class pathFinder:
-    def __init__(self, grid, droneStart, numOfDiseases, numOfObstacles, wDist, wUnexplored, visualize):
+class PathFinder:
+    def __init__(self, grid, drone_start, num_of_diseases, num_of_obstacles, w_dist, w_unexplored, visualize):
         self.grid_size = grid
-        self.drone_start = droneStart
-        self.num_of_diseases = numOfDiseases
-        self.num_of_obstacles = numOfObstacles
+        self.drone_start = drone_start
+        self.num_of_diseases = num_of_diseases
+        self.num_of_obstacles = num_of_obstacles
         self.grid = np.zeros((self.grid_size, self.grid_size), dtype=int)
         self.diseases_loc = set()
         self.obstacles_loc = set()
-        self.w_dist = wDist
-        self.w_unexplored = wUnexplored
+        self.w_dist = w_dist
+        self.w_unexplored = w_unexplored
         self.visualize = visualize
 
-        for _ in range(self.num_of_diseases):
-            x, y = random.randint(0, self.grid_size-1), random.randint(0, self.grid_size-1)
-            while (x, y) in self.diseases_loc or (x, y) in self.obstacles_loc or (x, y) == self.drone_start:
-                x, y = random.randint(0, self.grid_size-1), random.randint(0, self.grid_size-1)
+        for x, y in DISEASE_CELL_CORD:
             self.grid[x][y] = DISEASE_CELL
             self.diseases_loc.add((x, y))
 
-        for _ in range(self.num_of_obstacles):
-            x, y = random.randint(0, self.grid_size-1), random.randint(0, self.grid_size-1)
-            while (x, y) in self.obstacles_loc or (x, y) in self.diseases_loc or (x, y) == self.drone_start:
-                x, y = random.randint(0, self.grid_size-1), random.randint(0, self.grid_size-1)
+        for x, y in OBSTACLE_CELL_CORD:
             self.grid[x][y] = OBSTACLE_CELL
             self.obstacles_loc.add((x, y))
 
         self.drone_map = np.full_like(self.grid, fill_value=UNKNOWN_CELL)
-        self.drone_map[droneStart] = 0
+        self.drone_map[drone_start] = 0
 
     def grid_to_gps(self, cell, home_gps, meters_per_cell=METERS_PER_CELL):
         lat0, lon0, alt0 = home_gps
@@ -183,8 +208,8 @@ class pathFinder:
             )
             scored.append((dist, unexplored, f))
 
-        front = pathFinder.pareto_front(scored)
-        chosen = pathFinder.knee_by_utopia(front)
+        front = PathFinder.pareto_front(scored)
+        chosen = PathFinder.knee_by_utopia(front)
         best_frontier = chosen[2]
 
         path = astar(cur_pos, best_frontier, self.drone_map, self.grid_size)
@@ -293,7 +318,7 @@ def goto_and_wait(vehicle, lat, lon, alt, timeout=GOTO_TIMEOUT, reach_thresh=REA
         if time.time()-t0>timeout:
             print("WARN: goto timeout, remaining %.1f m"%dist)
             return False
-        time.sleep(0.7)
+        time.sleep(0.1)
 
 def main(args):
     print("Connecting to vehicle on:", DRONEKIT_CONN)
@@ -301,10 +326,11 @@ def main(args):
 
     grid_size=args.grid
     droneStart=tuple(map(int,args.droneStart.split(',')))
-    pf=pathFinder(grid_size, droneStart, args.numOfDisease, args.numOfObstacles,
-                  args.weightDistance, args.weightUnexplored, visualize= not args.no_visualize)
-
-    viz=Visualizer(grid_size, pf.obstacles_loc, pf.diseases_loc, droneStart)
+    pf=PathFinder(grid_size, droneStart, args.numOfDisease, args.numOfObstacles,
+                  args.weightDistance, args.weightUnexplored, visualize= True)
+    visualize = True
+    if visualize:
+        viz=Visualizer(grid_size, pf.obstacles_loc, pf.diseases_loc, droneStart)
     t=threading.Thread(target=start_turtle_loop, daemon=True)
     t.start()
     time.sleep(0.5)
@@ -334,12 +360,15 @@ def main(args):
             lat, lon, alt=pf.grid_to_gps(node, home_gps, METERS_PER_CELL)
             print(f"Flying to {node} -> {lat:.6f},{lon:.6f}")
             steps_taken += 1
-            viz.move_drone(node[0], node[1])
+            if visualize:
+                viz.move_drone(node[0], node[1])
+                viz.screen.update()
+                time.sleep(0.1)
+                viz.mark_visited(node[0], node[1])
+                if pf.grid[node[0]][node[1]] == 1:
+                    viz.mark_disease(node[0], node[1])
             goto_and_wait(vehicle, lat, lon, alt, timeout=GOTO_TIMEOUT)
             pf.check_disease(node)
-            viz.mark_visited(node[0], node[1])
-            if pf.grid[node[0]][node[1]]==1:
-                viz.mark_disease(node[0], node[1])
             frontiers.update(pf.neighbour(node))
             cur_pos=node
             visited.add(node)
@@ -357,7 +386,7 @@ def main(args):
 
 if __name__=="__main__":
     parser=argparse.ArgumentParser(description="")
-    parser.add_argument("--grid", type=int, default=10)
+    parser.add_argument("--grid", type=int, default=50)
     parser.add_argument("--droneStart", type=str, default="0,0")
     parser.add_argument("--numOfDisease", type=int, default=3)
     parser.add_argument("--numOfObstacles", type=int, default=5)
