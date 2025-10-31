@@ -209,33 +209,22 @@ class AirSimDroneController:
         pos = self.client.getMultirotorState().kinematics_estimated.position
         
         for point in points:
-            # Calculate distance from drone
             dist = np.linalg.norm(point[:2])  # Horizontal distance
             
-            # Filter points by height relative to drone
             point_height_relative = point[2] - pos.z_val
             
-            # Only consider points within detection range and at obstacle height
             if (dist < LIDAR_RANGE and 
                 LIDAR_MIN_HEIGHT < point_height_relative < LIDAR_MAX_HEIGHT and
-                dist > 0.1):  # Ignore very close points (noise)
-                
-                # Convert LiDAR point to grid coordinates
-                # LiDAR gives relative position in body frame
-                # For NED frame: x=forward(North), y=right(East), z=down
+                dist > 0.1):
                 world_north = pos.x_val + point[0]
                 world_east = pos.y_val + point[1]
                 
                 grid_x, grid_y = self.ned_to_grid(world_north, world_east)
                 
-                # Check if within grid bounds
                 if 0 <= grid_x < self.grid_size and 0 <= grid_y < self.grid_size:
-                    # Mark cells with detected obstacles
                     if dist < OBSTACLE_THRESHOLD:
-                        # Add the obstacle cell
                         obstacles.add((grid_x, grid_y))
                         
-                        # Add buffer cells around obstacle for safety
                         for dx in range(-OBSTACLE_BUFFER_CELLS, OBSTACLE_BUFFER_CELLS + 1):
                             for dy in range(-OBSTACLE_BUFFER_CELLS, OBSTACLE_BUFFER_CELLS + 1):
                                 buf_x, buf_y = grid_x + dx, grid_y + dy
@@ -245,9 +234,7 @@ class AirSimDroneController:
         return list(obstacles)
     
     def check_disease(self, cell):
-        """Simulate disease detection (could use camera/multispectral sensor)"""
         x, y = cell
-        # Simulate detection within range
         for disease_cell in self.disease_locations:
             dx = abs(disease_cell[0] - x)
             dy = abs(disease_cell[1] - y)
@@ -255,13 +242,15 @@ class AirSimDroneController:
                 return disease_cell
         return None
     
-    def scan_surroundings(self, current_cell, viz=None):
+    def scan_surroundings(self, current_cell, viz=None, frontiers=None):
         """Scan surroundings using LiDAR and update map"""
         # Detect obstacles with LiDAR
         obstacles = self.detect_obstacles_from_lidar(current_cell)
         
+        print(f"LiDAR detected {len(obstacles)} obstacle cells at position {current_cell}")
+        
         for obs in obstacles:
-            if self.drone_map[obs] == UNKNOWN_CELL:
+            if self.drone_map[obs] == UNKNOWN_CELL or self.drone_map[obs] == FREE_CELL:
                 self.drone_map[obs] = OBSTACLE_CELL
                 if viz:
                     viz.mark_obstacle(obs[0], obs[1])
@@ -274,12 +263,18 @@ class AirSimDroneController:
                 viz.mark_disease(disease_cell[0], disease_cell[1])
         
         # Mark unexplored neighbors as free if no obstacle detected
+        # Be more conservative - only mark as free if we're close enough
         neighbors = self.get_neighbors(current_cell)
         for neighbor in neighbors:
             if self.drone_map[neighbor] == UNKNOWN_CELL:
-                # Check if LiDAR detected this as obstacle
+                # Only mark as free if not detected as obstacle
                 if neighbor not in obstacles:
-                    self.drone_map[neighbor] = FREE_CELL
+                    # Only mark immediate neighbors (1 cell away) as free
+                    dx = abs(neighbor[0] - current_cell[0])
+                    dy = abs(neighbor[1] - current_cell[1])
+                    if dx <= 1 and dy <= 1:
+                        self.drone_map[neighbor] = FREE_CELL
+                        frontiers.add(neighbor)
     
     def get_neighbors(self, cell):
         """Get valid neighboring cells"""
@@ -292,13 +287,25 @@ class AirSimDroneController:
         return neighbors
     
     def move_to_cell(self, target_cell):
-        """Move drone to target grid cell"""
+        """Move drone to target grid cell with collision checking"""
+        # First, scan before moving
+        obstacles = self.detect_obstacles_from_lidar(self.ned_to_grid(
+            self.client.getMultirotorState().kinematics_estimated.position.x_val,
+            self.client.getMultirotorState().kinematics_estimated.position.y_val
+        ))
+        
+        # Check if target cell is now marked as obstacle
+        if target_cell in obstacles or self.drone_map[target_cell] == OBSTACLE_CELL:
+            print(f"WARNING: Target cell {target_cell} is blocked!")
+            return False
+        
         north, east, down = self.grid_to_ned(target_cell)
         print(f"Moving to cell {target_cell} -> NED({north:.2f}, {east:.2f}, {down:.2f})")
         
         # Use slower velocity for higher precision with 0.5m cells
-        self.client.moveToPositionAsync(north, east, down, velocity=1.5).join()
-        time.sleep(0.15)
+        self.client.moveToPositionAsync(north, east, down, velocity=1.0).join()
+        time.sleep(0.2)
+        return True
     
     def land_and_disarm(self):
         """Land the drone and disarm"""
@@ -308,46 +315,87 @@ class AirSimDroneController:
         self.client.enableApiControl(False)
 
 class PathFinder:
+    
     @staticmethod
-    def get_frontiers(drone_map, visited):
-        """Find frontier cells (free cells adjacent to unknown cells)"""
-        frontiers = set()
-        grid_size = len(drone_map)
+    def next_step(cur_pos, frontiers, drone_map):
+        """Select best frontier using Pareto optimization"""
+        if not frontiers:
+            return None, None
         
-        for x in range(grid_size):
-            for y in range(grid_size):
-                if (x, y) in visited:
+        grid_size = len(drone_map)
+        scored = []
+        
+        for f in frontiers:
+            # Calculate Manhattan distance
+            dist = abs(f[0] - cur_pos[0]) + abs(f[1] - cur_pos[1])
+            
+            # Count unexplored neighbors
+            unexplored = sum(
+                1
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                if 0 <= f[0] + dx < grid_size
+                and 0 <= f[1] + dy < grid_size
+                and drone_map[f[0] + dx][f[1] + dy] == UNKNOWN_CELL
+            )
+            
+            scored.append((dist, unexplored, f))
+        
+        # Get Pareto front
+        front = PathFinder.pareto_front(scored)
+        
+        # Select knee point from Pareto front
+        chosen = PathFinder.knee_by_utopia(front)
+        best_frontier = chosen[2]
+        
+        # Plan path to best frontier
+        path = astar(cur_pos, best_frontier, drone_map, grid_size)
+        
+        return best_frontier, path
+    
+    @staticmethod
+    def knee_by_utopia(pareto):
+        """Find knee point in Pareto front using utopia point method"""
+        # pareto is [(dist, unexplored, frontier_cell)]
+        min_dist = min(p[0] for p in pareto)
+        max_unexplored = max(p[1] for p in pareto)
+        
+        # utopia = (min dist, max unexplored)
+        utopia = (min_dist, -max_unexplored)  # convert unexplored to negative
+        
+        best = None
+        best_d = float('inf')
+        for dist, unexplored, f in pareto:
+            d = math.hypot(dist - utopia[0], (-unexplored) - utopia[1])
+            if d < best_d:
+                best_d = d
+                best = (dist, unexplored, f)
+        return best
+    
+    @staticmethod
+    def pareto_front(points):
+        """Extract Pareto-optimal points from scored frontiers"""
+        pts = [(d, -u, f) for d, u, f in points]
+        front = []
+        
+        for i, (d1, u1, f1) in enumerate(pts):
+            dominated = False
+            for j, (d2, u2, _) in enumerate(pts):
+                if j == i:
                     continue
-                if drone_map[x, y] == FREE_CELL:
-                    # Check if adjacent to unknown cell
-                    for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
-                        nx, ny = x + dx, y + dy
-                        if (0 <= nx < grid_size and 0 <= ny < grid_size and
-                            drone_map[nx, ny] == UNKNOWN_CELL):
-                            frontiers.add((x, y))
-                            break
-        return frontiers
+                # j dominates i if <= on both and < on at least one
+                if d2 <= d1 and u2 <= u1 and (d2 < d1 or u2 < u1):
+                    dominated = True
+                    break
+            if not dominated:
+                front.append(points[i])
+        
+        return front
     
     @staticmethod
     def select_best_frontier(current_pos, frontiers, drone_map):
-        """Select best frontier using distance and unexplored neighbors"""
-        if not frontiers:
-            return None
-        
-        scored = []
-        for f in frontiers:
-            dist = abs(f[0] - current_pos[0]) + abs(f[1] - current_pos[1])
-            unexplored = sum(
-                1 for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]
-                if (0 <= f[0]+dx < len(drone_map) and 
-                    0 <= f[1]+dy < len(drone_map) and
-                    drone_map[f[0]+dx, f[1]+dy] == UNKNOWN_CELL)
-            )
-            scored.append((dist, unexplored, f))
-        
-        # Select frontier with good balance
-        scored.sort(key=lambda x: (x[0], -x[1]))  # Min distance, max unexplored
-        return scored[0][2]
+        """Legacy method - now uses next_step with Pareto optimization"""
+        best_frontier, path = PathFinder.next_step(current_pos, frontiers, drone_map)
+        return best_frontier
 
 def main(args):
     grid_size = args.grid
@@ -374,58 +422,118 @@ def main(args):
     visited = {current_pos}
     
     # Scan initial position
-    controller.scan_surroundings(current_pos, viz)
+    frontiers = set()
+    controller.scan_surroundings(current_pos, viz, frontiers)
     
     # Main exploration loop
-    while True:
-        # Get frontiers
-        frontiers = PathFinder.get_frontiers(controller.drone_map, visited)
+    iteration = 0
+    while frontiers:
+        iteration += 1
+        print(f"\n=== Iteration {iteration} ===")
+        
+        #Get frontiers using proper frontier detection
+        
+        # Count unknown cells
+        unknown_count = np.sum(controller.drone_map == UNKNOWN_CELL)
+        obstacle_count = np.sum(controller.drone_map == OBSTACLE_CELL)
+        free_count = np.sum(controller.drone_map == FREE_CELL)
+        
+        print(f"Map status: Unknown={unknown_count}, Free={free_count}, Obstacles={obstacle_count}, Visited={len(visited)}")
         
         if not frontiers:
-            print("No more frontiers to explore!")
-            break
+            if unknown_count > 0:
+                print(f"WARNING: {unknown_count} unknown cells remain but no frontiers found!")
+                print("This may happen if unknown areas are unreachable due to obstacles.")
+                
+                # Try to find any unvisited free cells
+                unvisited_free = set()
+                for x in range(grid_size):
+                    for y in range(grid_size):
+                        if (x, y) not in visited and controller.drone_map[x, y] == FREE_CELL:
+                            unvisited_free.add((x, y))
+                
+                if unvisited_free:
+                    print(f"Found {len(unvisited_free)} unvisited free cells, continuing...")
+                    frontiers = unvisited_free
+                else:
+                    print("No more reachable cells to explore.")
+                    break
+            else:
+                print("All reachable cells explored!")
+                break
         
         # Select best frontier
         target = PathFinder.select_best_frontier(current_pos, frontiers, controller.drone_map)
-        
+        print(len(frontiers))
         if target is None:
+            print("No valid target selected.")
             break
+        
+        print(f"Target frontier: {target}")
         
         # Plan path to target
         path = astar(current_pos, target, controller.drone_map, grid_size)
         
         if path is None or len(path) <= 1:
-            print(f"No valid path to {target}")
+            print(f"No valid path to {target}, marking as unreachable")
             visited.add(target)  # Mark as visited to avoid trying again
+            if target in frontiers:
+                frontiers.remove(target)
             continue
+        
+        print(f"Path length: {len(path)} cells")
         
         # Follow path
         for node in path[1:]:
             steps_taken += 1
-            controller.move_to_cell(node)
+            
+            # Scan before moving to detect new obstacles
+            controller.scan_surroundings(current_pos, viz, frontiers)
+            
+            # Check if path is still valid (no new obstacles detected)
+            if controller.drone_map[node] == OBSTACLE_CELL:
+                print(f"Path blocked at {node}, replanning...")
+                break
+            
+            success = controller.move_to_cell(node)
+            if not success:
+                print(f"Failed to move to {node}, replanning...")
+                break
             
             if viz:
                 viz.move_drone(node[0], node[1])
                 viz.mark_visited(node[0], node[1])
-                time.sleep(0.1)
+                time.sleep(0.05)
             
             # Scan surroundings at new position
-            controller.scan_surroundings(node, viz)
+            controller.scan_surroundings(node, viz, frontiers)
             
             current_pos = node
             visited.add(node)
+            if node in frontiers and node in visited:
+                frontiers.remove(node)
+        
+        # Limit iterations to prevent infinite loops
+        if iteration > grid_size * grid_size:
+            print("Maximum iterations reached!")
+            break
     
     end_time = time.time()
-    print(f"\nExploration Complete!")
+    print(f"\n=== Exploration Complete! ===")
     print(f"Time taken: {(end_time - start_time):.2f} seconds")
     print(f"Steps taken: {steps_taken}")
     print(f"Cells visited: {len(visited)}")
+    print(f"Total iterations: {iteration}")
     
     # Count detected diseases and obstacles
     diseases_found = np.sum(controller.drone_map == DISEASE_CELL)
     obstacles_found = np.sum(controller.drone_map == OBSTACLE_CELL)
+    explored_cells = np.sum(controller.drone_map != UNKNOWN_CELL)
+    coverage_percent = (explored_cells / (grid_size * grid_size)) * 100
+    
     print(f"Diseases detected: {diseases_found}")
     print(f"Obstacles detected: {obstacles_found}")
+    print(f"Map coverage: {coverage_percent:.1f}%")
     
     controller.land_and_disarm()
     print("Mission complete!")
