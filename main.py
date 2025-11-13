@@ -1,8 +1,6 @@
-# full script (modified with fixes described)
 import time
 import math
 import threading
-import argparse
 import numpy as np
 import airsim
 from astar import astar 
@@ -10,43 +8,26 @@ import matplotlib.pyplot as plt
 import os
 
 CELL_SIZE_PIXELS = 5
-METERS_PER_CELL = 0.5  # High resolution: each cell is 0.5 meters
-TAKEOFF_ALT = 3.0  # Higher altitude for better LiDAR coverage and safety
-REACH_THRESH_M = 0.25  # Tighter threshold for 0.5m cells
+METERS_PER_CELL = 0.5  
+TAKEOFF_ALT = 3.0  
+REACH_THRESH_M = 0.25  
 UNKNOWN_CELL = -1
 FREE_CELL = 0
 DISEASE_CELL = 1
 OBSTACLE_CELL = 2
 
-# LiDAR detection parameters
-LIDAR_RANGE = 8.0  # meters - scan further ahead
-OBSTACLE_THRESHOLD = 2.0  # meters - more conservative obstacle detection
-DISEASE_DETECTION_RANGE = 1.0  # meters - range to detect disease
-LIDAR_MIN_HEIGHT = -1.0  # relative to drone, filter ground points
-LIDAR_MAX_HEIGHT = 4.0  # relative to drone, filter high points
-OBSTACLE_BUFFER_CELLS = 1  # Add buffer around detected obstacles
-
-import sys
-import datetime
-
-class DualOutput:
-    def __init__(self, filename):
-        self.terminal = sys.stdout
-        self.log = open(filename, "w", encoding="utf-8")
-
-    def write(self, message):
-        self.terminal.write(message)   # show live in console
-        self.log.write(message)        # save to file
-
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
+LIDAR_RANGE = 8.0  
+OBSTACLE_THRESHOLD = 2.0  
+DISEASE_DETECTION_RANGE = 1.0  
+LIDAR_MIN_HEIGHT = -1.0  
+LIDAR_MAX_HEIGHT = 4.0  
+OBSTACLE_BUFFER_CELLS = 1  
 
 class AirSimDroneController:
     def __init__(self, grid_size, drone_start, vehicle_name, lidar_name, visualize=True, ip="127.0.0.1"):
         self.client = airsim.MultirotorClient(ip=ip)
         self.client.confirmConnection()
-        # enable API control and arm for specific vehicle
+        
         self.vehicle_name = vehicle_name
         self.client.enableApiControl(True, vehicle_name=self.vehicle_name)
         self.client.armDisarm(True, vehicle_name=self.vehicle_name)
@@ -60,9 +41,9 @@ class AirSimDroneController:
         self.snapshots = []
         self.snap_freq = 50
 
-        # Initialize grid map (drone's knowledge) - stored as [y, x]
+        
         self.drone_map = np.full((grid_size, grid_size), fill_value=UNKNOWN_CELL, dtype=np.int8)
-        # set start cell free
+        
         sx, sy = drone_start
         self.drone_map[sy, sx] = FREE_CELL
 
@@ -77,9 +58,9 @@ class AirSimDroneController:
         dx = (x_cell - self.start_cell[0]) * METERS_PER_CELL
         dy = (y_cell - self.start_cell[1]) * METERS_PER_CELL
 
-        # north = origin_ned.x + dy, east = origin_ned.y + dx
-        ned_x = self.origin_ned[0] + dy  # north
-        ned_y = self.origin_ned[1] + dx  # east
+        
+        ned_x = self.origin_ned[0] + dy  
+        ned_y = self.origin_ned[1] + dx  
         ned_z = -TAKEOFF_ALT
         return ned_x, ned_y, ned_z
 
@@ -87,9 +68,9 @@ class AirSimDroneController:
         """Convert world NED coords to grid coords anchored at origin_ned and start_cell"""
         if self.origin_ned is None:
             raise RuntimeError("origin_ned not set; call takeoff() first to set origin")
-        # compute offset from origin (in meters)
-        dx_m = east - self.origin_ned[1]   # east offset
-        dy_m = north - self.origin_ned[0]  # north offset
+        
+        dx_m = east - self.origin_ned[1]   
+        dy_m = north - self.origin_ned[0]  
 
         x = int(round(dx_m / METERS_PER_CELL)) + self.start_cell[0]
         y = int(round(dy_m / METERS_PER_CELL)) + self.start_cell[1]
@@ -103,7 +84,7 @@ class AirSimDroneController:
 
         pos = self.client.getMultirotorState(vehicle_name=self.vehicle_name).kinematics_estimated.position
         self.home_position = (pos.x_val, pos.y_val, pos.z_val)
-        # Set origin for conversions (anchor)
+        
         self.origin_ned = (pos.x_val, pos.y_val, pos.z_val)
         print(f"{self.vehicle_name}: Home position (NED): {self.home_position}")
 
@@ -123,8 +104,6 @@ class AirSimDroneController:
         """Process LiDAR data to detect obstacles in nearby cells with safety buffer"""
         points = self.get_lidar_data()
         if points.shape[0] == 0:
-            # no points returned
-            #print(f"{self.vehicle_name}: LiDAR returned 0 points!")
             return []
 
         obstacles = set()
@@ -135,9 +114,6 @@ class AirSimDroneController:
             if horiz_dist < 1e-3 or horiz_dist > LIDAR_RANGE:
                 continue
 
-            # interpret sensor local z as relative down offset; combine per earlier discussion
-            # point[2] is sensor-local down; height relative to drone is -point[2] (if needed)
-            # We'll use point[2] for a simple pass-through check along with configured min/max
             if not (LIDAR_MIN_HEIGHT < point[2] < LIDAR_MAX_HEIGHT):
                 continue
 
@@ -148,13 +124,13 @@ class AirSimDroneController:
 
             if 0 <= grid_x < self.grid_size and 0 <= grid_y < self.grid_size:
                 if horiz_dist < OBSTACLE_THRESHOLD:
-                    # add cell + buffer
+                    
                     for dx in range(-OBSTACLE_BUFFER_CELLS, OBSTACLE_BUFFER_CELLS + 1):
                         for dy in range(-OBSTACLE_BUFFER_CELLS, OBSTACLE_BUFFER_CELLS + 1):
                             bx, by = grid_x + dx, grid_y + dy
                             if 0 <= bx < self.grid_size and 0 <= by < self.grid_size:
                                 obstacles.add((bx, by))
-        #print(f"{self.vehicle_name} LiDAR detected {len(obstacles)} obstacle cells at {current_cell}")
+        
         return list(obstacles)
 
     def check_disease(self, cell):
@@ -172,8 +148,7 @@ class AirSimDroneController:
             frontiers = set()
 
         obstacles = self.detect_obstacles_from_lidar(current_cell)
-        #print(f"{self.vehicle_name} LiDAR detected {len(obstacles)} obstacle cells at position {current_cell}")
-        #print(obstacles)
+                
         for obs in obstacles:
             ox, oy = obs
             if self.drone_map[oy, ox] in (UNKNOWN_CELL, FREE_CELL):
@@ -210,7 +185,7 @@ class AirSimDroneController:
         return neighbors
 
     def move_to_cell(self, target_cell):
-        # compute current grid cell for obstacle check
+        
         pos = self.client.getMultirotorState(vehicle_name=self.vehicle_name).kinematics_estimated.position
         current_grid = self.ned_to_grid(pos.x_val, pos.y_val)
         obstacles = self.detect_obstacles_from_lidar(current_grid)
@@ -220,7 +195,7 @@ class AirSimDroneController:
             return False
 
         north, east, down = self.grid_to_ned(target_cell)
-        #print(f"{self.vehicle_name}: Moving to cell {target_cell} -> NED({north:.2f}, {east:.2f}, {down:.2f})")
+        
         self.client.moveToPositionAsync(north, east, down, velocity=1.0, vehicle_name=self.vehicle_name).join()
         time.sleep(0.2)
         return True
@@ -235,40 +210,32 @@ class AirSimDroneController:
         self.client.enableApiControl(False, vehicle_name=self.vehicle_name)
 
 class PathFinder:
-
     @staticmethod
     def next_step(cur_pos, frontiers, drone_map):
         """Select best frontier using Pareto optimization"""
         if not frontiers:
             return None, None
 
-        grid_h, grid_w = drone_map.shape  # rows(y), cols(x)
+        grid_h, grid_w = drone_map.shape  
         scored = []
 
-        disease_positions = np.argwhere(drone_map == DISEASE_CELL)  # (y,x) pairs
-
+        disease_positions = np.argwhere(drone_map == DISEASE_CELL)  
         for f in frontiers:
             fx, fy = f
-            # Manhattan distance
             dist = abs(fx - cur_pos[0]) + abs(fy - cur_pos[1])
-
-            # unexplored neighbors (4-connected)
             unexplored = 0
             for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
                 nx, ny = fx + dx, fy + dy
                 if 0 <= nx < grid_w and 0 <= ny < grid_h:
                     if drone_map[ny, nx] == UNKNOWN_CELL:
                         unexplored += 1
-
-            # disease proximity: compute Manhattan distance from current pos to nearest disease cell
             if disease_positions.size > 0:
-                dxs = np.abs(disease_positions[:, 1] - cur_pos[0])  # x differences
-                dys = np.abs(disease_positions[:, 0] - cur_pos[1])  # y differences
+                dxs = np.abs(disease_positions[:, 1] - cur_pos[0])  
+                dys = np.abs(disease_positions[:, 0] - cur_pos[1])  
                 manh = dxs + dys
                 min_dist = np.min(manh)
             else:
                 min_dist = float('inf')
-
             if min_dist <= 1:
                 disease_proximity = 50.0
             elif min_dist < 5:
@@ -341,7 +308,7 @@ def drone_task(controller, viz, quadrant_bounds):
 
     while frontiers:
         valid_frontiers = {f for f in frontiers if x_min <= f[0] <= x_max and y_min <= f[1] <= y_max}
-        #print(controller.drone_map)
+        
         if not valid_frontiers:
             break
 
@@ -350,7 +317,7 @@ def drone_task(controller, viz, quadrant_bounds):
             break
 
         path = astar(current_pos, target, controller.drone_map, controller.grid_size)
-        #print(path, target, current_pos)
+        
         if path is None or len(path) <= 1:
             visited.add(target)
             frontiers.discard(target)
@@ -370,7 +337,7 @@ def drone_task(controller, viz, quadrant_bounds):
                 break
 
             if viz:
-                # safe: viz is None for multi-drone mode to avoid Tkinter threading issues
+                
                 viz.move_drone(node[0], node[1])
                 viz.mark_visited(node[0], node[1])
                 time.sleep(0.02)
@@ -381,8 +348,7 @@ def drone_task(controller, viz, quadrant_bounds):
 
             if steps_taken % controller.snap_freq == 0:
                 controller.snapshots.append(controller.drone_map.copy())
-
-                # Track coverage progress
+                
         known_cells = np.sum(controller.drone_map != UNKNOWN_CELL)
         coverage_percent = (known_cells / controller.drone_map.size) * 100
 
@@ -406,31 +372,6 @@ def drone_task(controller, viz, quadrant_bounds):
 
     controller.land_and_disarm()
 
-    print(controller.drone_map)
-
-class MatplotlibVisualizer:
-    def __init__(self, grid_size, start_pos=None):
-        self.grid_size = grid_size
-        self.fig, self.ax = plt.subplots(figsize=(6, 6))
-        self.ax.set_title(f"Drone Map (start {start_pos})")
-        self.ax.set_xticks([]); self.ax.set_yticks([])
-        self.img = self.ax.imshow(np.ones((grid_size, grid_size)) * -1,
-                                  cmap="viridis", vmin=-1, vmax=3)
-        plt.ion(); plt.show(block=False)
-
-    def update(self, grid, drone_pos=None):
-        display = grid.copy()
-        if drone_pos is not None:
-            x, y = drone_pos
-            if 0 <= x < self.grid_size and 0 <= y < self.grid_size:
-                display[x, y] = 4
-        self.img.set_data(display)
-        self.fig.canvas.draw_idle()
-        plt.pause(0.001)
-
-import numpy as np
-import matplotlib.pyplot as plt
-
 def visualize_exploration(controllers):
     """
     Combine 4 drone maps into one RGB visualization.
@@ -443,29 +384,29 @@ def visualize_exploration(controllers):
     DISEASE_CELL = 1
 
     drone_colors = [
-        [1.0, 0.0, 0.0],   # Drone 1 - Red
-        [0.0, 0.0, 1.0],   # Drone 2 - Blue
-        [0.0, 1.0, 0.0],   # Drone 3 - Green
-        [1.0, 1.0, 0.0]    # Drone 4 - Yellow
+        [1.0, 0.0, 0.0],   
+        [0.0, 0.0, 1.0],   
+        [0.0, 1.0, 0.0],   
+        [1.0, 1.0, 0.0]    
     ]
 
-    # Each drone map is 1/4 of total area (assume all same size)
+    
     local_size = controllers[0].drone_map.shape[0]
-    global_size = local_size * 2  # 2x2 layout
+    global_size = local_size * 2  
 
-    # Initialize RGB and combined maps
-    rgb_map = np.ones((global_size, global_size, 3))  # start as white (unknown)
+    
+    rgb_map = np.ones((global_size, global_size, 3))  
     combined_map = np.full((global_size, global_size), UNKNOWN_CELL)
 
-    # Position offsets for 4 quadrants: (y_offset, x_offset)
+    
     offsets = [
-        (0, 0),                 # Drone 1 - bottom-left
-        (local_size, 0),        # Drone 2 - bottom-right
-        (local_size, local_size),# Drone 3 - top-right
-        (0, local_size)         # Drone 4 - top-left
+        (0, 0),                 
+        (local_size, 0),        
+        (local_size, local_size),
+        (0, local_size)         
     ]
 
-    # Blend each drone map into the global RGB map
+    
     for i, ctrl in enumerate(controllers):
         drone_map = ctrl.drone_map
         color = np.array(drone_colors[i])
@@ -486,11 +427,11 @@ def visualize_exploration(controllers):
                     rgb_map[gy, gx] = [1, 0, 1]
                     combined_map[gy, gx] = DISEASE_CELL
 
-    # Compute coverage %
+    
     known_cells = np.sum(combined_map != UNKNOWN_CELL)
     coverage_percent = known_cells / combined_map.size * 100
 
-    # Plot
+    
     plt.figure(figsize=(8, 8))
     plt.imshow(rgb_map, origin="lower")
     plt.title(f"🛰️ Multi-Drone Exploration Map (4 Quadrants) — Coverage: {coverage_percent:.1f}%")
@@ -498,7 +439,7 @@ def visualize_exploration(controllers):
     plt.ylabel("Global Grid Y")
     plt.grid(True, color="gray", linestyle=":", linewidth=0.5)
 
-    # Legend
+    
     for i, color in enumerate(drone_colors, 1):
         plt.scatter([], [], color=color, label=f"Drone {i}")
     plt.scatter([], [], color='black', label='Obstacle')
@@ -518,29 +459,29 @@ def visualize_exploration_i(controllers, index):
     DISEASE_CELL = 1
 
     drone_colors = [
-        [1.0, 0.0, 0.0],   # Drone 1 - Red
-        [0.0, 0.0, 1.0],   # Drone 2 - Blue
-        [0.0, 1.0, 0.0],   # Drone 3 - Green
-        [1.0, 1.0, 0.0]    # Drone 4 - Yellow
+        [1.0, 0.0, 0.0],   
+        [0.0, 0.0, 1.0],   
+        [0.0, 1.0, 0.0],   
+        [1.0, 1.0, 0.0]    
     ]
 
-    # Each drone map is 1/4 of total area (assume all same size)
+    
     local_size = controllers[0].drone_map.shape[0]
-    global_size = local_size * 2  # 2x2 layout
+    global_size = local_size * 2  
 
-    # Initialize RGB and combined maps
-    rgb_map = np.ones((global_size, global_size, 3))  # start as white (unknown)
+    
+    rgb_map = np.ones((global_size, global_size, 3))  
     combined_map = np.full((global_size, global_size), UNKNOWN_CELL)
 
-    # Position offsets for 4 quadrants: (y_offset, x_offset)
+    
     offsets = [
-        (0, 0),                 # Drone 1 - bottom-left
-        (local_size, 0),        # Drone 2 - bottom-right
-        (local_size, local_size),# Drone 3 - top-right
-        (0, local_size)         # Drone 4 - top-left
+        (0, 0),                 
+        (local_size, 0),        
+        (local_size, local_size),
+        (0, local_size)         
     ]
 
-    # Blend each drone map into the global RGB map
+    
     for i, ctrl in enumerate(controllers):
         drone_map = ctrl.snapshots[index]
         color = np.array(drone_colors[i])
@@ -561,19 +502,17 @@ def visualize_exploration_i(controllers, index):
                     rgb_map[gy, gx] = [1, 0, 1]
                     combined_map[gy, gx] = DISEASE_CELL
 
-    # Compute coverage %
+    
     known_cells = np.sum(combined_map != UNKNOWN_CELL)
     coverage_percent = known_cells / combined_map.size * 100
 
-    # Plot
     plt.figure(figsize=(8, 8))
     plt.imshow(rgb_map, origin="lower")
     plt.title(f"🛰️ Multi-Drone Exploration Map (4 Quadrants) — Coverage: {coverage_percent:.1f}%")
     plt.xlabel("Global Grid X")
     plt.ylabel("Global Grid Y")
     plt.grid(True, color="gray", linestyle=":", linewidth=0.5)
-
-    # Legend
+    
     for i, color in enumerate(drone_colors, 1):
         plt.scatter([], [], color=color, label=f"Drone {i}")
     plt.scatter([], [], color='black', label='Obstacle')
@@ -582,24 +521,19 @@ def visualize_exploration_i(controllers, index):
     os.makedirs("images", exist_ok=True)
     plt.savefig(f"images/temp{index}.png")
 
-def main(args):
-    GLOBAL_GRID_SIZE = 40       # total area (20m × 20m)
-    LOCAL_GRID_SIZE = 20  # each drone’s map (10m × 10m)
+def main():
+    GLOBAL_GRID_SIZE = 40       
+    LOCAL_GRID_SIZE = 20  
 
-    # Quadrant bounds in global coordinates (x_min, x_max, y_min, y_max)
     quadrants_bounds = [
-        (0, 19, 0, 19),  # top-left
-        (0, 19, 0, 19),  # top-right
-        (0, 19, 0, 19),  # bottom-left
-        (0, 19, 0, 19),  # bottom-right
+        (0, 19, 0, 19),  
+        (0, 19, 0, 19),  
+        (0, 19, 0, 19),  
+        (0, 19, 0, 19),  
     ]
-
     drones = []
     vizs = []
-
-    # Each drone has its own 20×20 grid, centered at (10,10) in its local map
     local_center = (10,10)
-
     for i in range(4):
         vehicle_name = f"Drone{i+1}"
         lidar_name = f"LidarSensor{i+1}"
@@ -614,24 +548,13 @@ def main(args):
         drones.append(controller)
         vizs.append(None)
 
-    drones[0].drone_map[10, 5] = DISEASE_CELL
-    drones[0].drone_map[11, 5] = DISEASE_CELL
-    drones[0].drone_map[10, 4] = DISEASE_CELL
-
-    drones[1].drone_map[5, 10] = DISEASE_CELL
-    drones[1].drone_map[6, 10] = DISEASE_CELL
-
-    drones[2].drone_map[15, 15] = DISEASE_CELL
-
-    # Disable per-drone visualization (Tkinter thread safety)
-    if not args.no_visualize:
-        print("Visualization disabled for multi-drone mode (turtle/matplotlib threading limits).")
-
-    # Takeoff all drones
+    drones[0].diseases=[[10, 5], [11, 5], [10,4]]
+    drones[1].diseases = [[5, 10], [6, 10]]
+    drones[2].diseases = [[15, 15]]
+    
     for d in drones:
         d.takeoff()
 
-    # Start threads for each quadrant
     threads = []
     for i, d in enumerate(drones):
         t = threading.Thread(target=drone_task, args=(d, vizs[i], quadrants_bounds[i]), daemon=False)
@@ -647,7 +570,4 @@ def main(args):
     visualize_exploration(controllers=drones)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AirSim Multi-Drone LiDAR Frontier Exploration")
-    parser.add_argument("--no-visualize", action="store_true", help="Disable visualization (recommended for multi-drone)")
-    args = parser.parse_args()
-    main(args)
+    main()
